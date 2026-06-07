@@ -21,4 +21,4 @@ echo "[start] starting stack (build + detach)..."
 docker compose up --build -d
 
 echo "[start] up. Following app logs (Ctrl-C to detach; containers keep running)..."
-docker compose logs -f tapo-manager
+docker compose logs -f tapo-observability

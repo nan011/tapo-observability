@@ -1,7 +1,16 @@
+# Cap container logs so the monitor's per-sample output can't fill the disk.
+# 5 files x 10MB = 50MB max per container, oldest rotated out.
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.3
     container_name: tapo-clickhouse
+    logging: *default-logging
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     ports:
@@ -21,9 +30,10 @@ services:
       timeout: 3s
       retries: 20
 
-  tapo-manager:
+  tapo-observability:
     build: .
-    container_name: tapo-manager
+    container_name: tapo-observability
+    logging: *default-logging
     # Bridge networking (default). The app reaches ClickHouse by service name and
     # reaches Tapo devices by unicast IP (the host NATs container -> LAN), so
     # monitor/status/on/off all work without host networking.

@@ -282,18 +282,27 @@ async def set_power(name: str, turn_on: bool) -> None:
 
 
 async def _sample(client: ApiClient, device: dict, cache: dict) -> float | None:
-    """Read one instantaneous power value. Returns None on error (and drops the
-    handler so it's rebuilt next time — self-heals dead sessions)."""
-    try:
-        h = cache.get(device["name"])
-        if h is None:
-            h = cache[device["name"]] = await handler_for(client, device)
-        power = await h.get_current_power()
-        return float(power.current_power)
-    except Exception as e:
-        cache.pop(device["name"], None)
-        print(f"# {device['name']} sample error: {e}", flush=True)
-        return None
+    """Read one instantaneous power value.
+
+    On failure (most often SESSION_TIMEOUT — the plug expires the KLAP session),
+    drop the cached handler and retry once: that rebuilds the handler, which
+    re-authenticates from scratch, so a stale session self-heals *within the same
+    sample* instead of losing it. Returns None only if the retry also fails.
+    """
+    name = device["name"]
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            h = cache.get(name)
+            if h is None:
+                h = cache[name] = await handler_for(client, device)  # (re)authenticate
+            power = await h.get_current_power()
+            return float(power.current_power)
+        except Exception as e:
+            last_err = e
+            cache.pop(name, None)  # force re-auth on the retry / next sample
+    print(f"# {name} sample error (after re-auth retry): {last_err}", flush=True)
+    return None
 
 
 async def _device_loop(
