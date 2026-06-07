@@ -1,0 +1,52 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    container_name: tapo-clickhouse
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports:
+      # Published so you can run `discover --save` (and ad-hoc queries) from the
+      # HOST against the same DB at localhost:8123.
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - tapo_clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  tapo-manager:
+    build: .
+    container_name: tapo-manager
+    # Bridge networking (default). The app reaches ClickHouse by service name and
+    # reaches Tapo devices by unicast IP (the host NATs container -> LAN), so
+    # monitor/status/on/off all work without host networking.
+    #
+    # The ONE thing a bridge can't do is DISCOVERY (UDP broadcast to the LAN).
+    # Run discovery on the HOST instead — it writes ./local/devices.json (mounted
+    # below) and, with ClickHouse up, the device/device_snapshot tables:
+    #     uv run python main.py discover --save
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_HOST: clickhouse          # service name on the compose network
+      CLICKHOUSE_PORT: "8123"
+      # monitor's two parameters (see scripts/entrypoint.sh):
+      MONITOR_DEVICES: "${MONITOR_DEVICES:-all}"   # which devices: name(s)/id prefix(es)/all
+      MONITOR_INTERVAL: "${MONITOR_INTERVAL:-300}" # window seconds (mean per window)
+      MONITOR_SAMPLE: "${MONITOR_SAMPLE:-5}"       # sample seconds within the window
+    volumes:
+      - ./local:/app/local       # registry (devices.json) — populated by host discovery
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  tapo_clickhouse_data:

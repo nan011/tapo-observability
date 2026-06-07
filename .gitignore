@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — never commit Tapo cloud credentials
+.env
+
+local/**/*
+
+# generated from docker-compose.yml.example by scripts/start.sh
+docker-compose.yml
