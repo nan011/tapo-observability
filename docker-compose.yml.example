@@ -1,3 +1,13 @@
+# Copy to docker-compose.yml, then edit freely — container_name included.
+# The scripts read each container_name out of THIS file, so renaming a
+# container_name is fine (just keep one). What you must NOT rename are the
+# SERVICE KEYS the scripts anchor on, or scripts/start.sh, scripts/stop.sh,
+# scripts/connect-to-db.sh, scripts/main.sh break:
+#   - service key `tapo-clickhouse`     (connect-to-db.sh reads its container_name)
+#   - service key `tapo-observability`  (main.sh reads its container_name; start.sh tails its logs)
+#   - `CLICKHOUSE_HOST` must equal the clickhouse service name (`tapo-clickhouse`)
+# Everything else (image tag, ports, ulimits, volumes, container_name, env) is safe.
+
 # Cap container logs so the monitor's per-sample output can't fill the disk.
 # 5 files x 10MB = 50MB max per container, oldest rotated out.
 x-logging: &default-logging
@@ -7,9 +17,9 @@ x-logging: &default-logging
     max-file: "5"
 
 services:
-  clickhouse:
+  tapo-clickhouse:                             # [scripts] don't rename this SERVICE KEY — connect-to-db.sh anchors on it
     image: clickhouse/clickhouse-server:26.3
-    container_name: tapo-clickhouse
+    container_name: tapo-clickhouse            # editable — connect-to-db.sh reads this value to exec the container
     logging: *default-logging
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
@@ -20,6 +30,10 @@ services:
       - "9000:9000"
     volumes:
       - tapo_clickhouse_data:/var/lib/clickhouse
+      # Disable system.*_log tables + cap text log (see file for details).
+      # Mount the single file (NOT the whole config.d dir) so the image's
+      # docker_related_config.xml — which sets listen_host — stays in place.
+      - ./clickhouse/config.d/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -30,9 +44,9 @@ services:
       timeout: 3s
       retries: 20
 
-  tapo-observability:
+  tapo-observability:                          # [scripts] don't rename this SERVICE KEY — start.sh/main.sh anchor on it
     build: .
-    container_name: tapo-observability
+    container_name: tapo-observability         # editable — main.sh reads this value to exec the container
     logging: *default-logging
     # Bridge networking (default). The app reaches ClickHouse by service name and
     # reaches Tapo devices by unicast IP (the host NATs container -> LAN), so
@@ -45,7 +59,7 @@ services:
     env_file:
       - .env
     environment:
-      CLICKHOUSE_HOST: clickhouse          # service name on the compose network
+      CLICKHOUSE_HOST: tapo-clickhouse     # [scripts] must equal the clickhouse service name above
       CLICKHOUSE_PORT: "8123"
       # monitor's two parameters (see scripts/entrypoint.sh):
       MONITOR_DEVICES: "${MONITOR_DEVICES:-all}"   # which devices: name(s)/id prefix(es)/all
@@ -54,7 +68,7 @@ services:
     volumes:
       - ./local:/app/local       # registry (devices.json) — populated by host discovery
     depends_on:
-      clickhouse:
+      tapo-clickhouse:
         condition: service_healthy
     restart: unless-stopped
 

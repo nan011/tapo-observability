@@ -1,12 +1,14 @@
 -- device_power_usage: one row per power reading emitted by `monitor`.
--- id and created_at are filled by the DB; name/ip/type are point-in-time snapshots.
+-- power_used is the MEAN watts over the `window_seconds` ending at power_used_at,
+-- so energy = power_used * window_seconds / 3600 / 1000 kWh. created_at is the
+-- DB insert time, filled by default.
 CREATE TABLE IF NOT EXISTS device_power_usage
 (
-    id            UUID         DEFAULT generateUUIDv7(),
-    device_id     String,
-    power_used    Float64,
-    power_used_at DateTime64(3),
-    created_at    DateTime64(3) DEFAULT now64(3)
+    device_id      LowCardinality(String),
+    power_used     Decimal32(3),
+    power_used_at  DateTime,
+    window_seconds UInt16,
+    created_at     DateTime DEFAULT now()
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(power_used_at)
@@ -17,12 +19,12 @@ ORDER BY (device_id, power_used_at);
 -- name/type/ip changes (and once when first seen).
 CREATE TABLE IF NOT EXISTS device_snapshot
 (
-    id         UUID          DEFAULT generateUUIDv7(),
-    device_id  String,
-    created_at DateTime64(3) DEFAULT now64(3),
-    name       String,
-    type       String,
-    ip         String
+    id         UUID DEFAULT generateUUIDv7(),
+    device_id  LowCardinality(String),
+    created_at DateTime DEFAULT now(),
+    name       LowCardinality(String),
+    type       LowCardinality(String),
+    ip         IPv4
 )
 ENGINE = MergeTree
 PRIMARY KEY (device_id, created_at)
@@ -32,13 +34,13 @@ ORDER BY (device_id, created_at);
 -- row with the greatest updated_at, so each device_id keeps only its newest row.
 CREATE TABLE IF NOT EXISTS device
 (
-    id         UUID          DEFAULT generateUUIDv7(),
-    device_id  String,
-    created_at DateTime64(3) DEFAULT now64(3),
-    updated_at DateTime64(3) DEFAULT now64(3),
-    name       String,
-    type       String,
-    ip         String
+    id         UUID DEFAULT generateUUIDv7(),
+    device_id  LowCardinality(String),
+    created_at DateTime DEFAULT now(),
+    updated_at DateTime DEFAULT now(),
+    name       LowCardinality(String),
+    type       LowCardinality(String),
+    ip         IPv4
 )
 ENGINE = ReplacingMergeTree(updated_at)
 PRIMARY KEY device_id

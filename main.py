@@ -316,6 +316,7 @@ async def _device_loop(
     """
     cache: dict = {}
     n = max(1, round(interval / sample_s))  # samples per window
+    prev_ts: datetime | None = None  # close time of the last row written for this device
     while True:
         samples: list[float] = []
         for i in range(n):
@@ -329,15 +330,26 @@ async def _device_loop(
             print(f"# {ts.isoformat()} {device['name']} no samples this window", flush=True)
             continue
         mean = sum(samples) / len(samples)
+        # Actual seconds since the previous row's power_used_at — the span this
+        # mean represents for energy (kWh = power_used * window_seconds / 3.6e6).
+        # First row has no predecessor; fall back to the nominal interval.
+        # Clamp to UInt16 range (the column type).
+        if prev_ts is None:
+            window_seconds = interval
+        else:
+            window_seconds = round((ts - prev_ts).total_seconds())
+        window_seconds = max(1, min(window_seconds, 65535))
         db.insert_power(
             ch,
             device_id=device.get("device_id") or "",
             power_used=mean,
             power_used_at=ts,
+            window_seconds=window_seconds,
         )
+        prev_ts = ts
         print(
             f"# {ts.isoformat()} {device['name']} mean {mean:.1f}W "
-            f"({len(samples)}/{n} samples) -> clickhouse",
+            f"({len(samples)}/{n} samples, {window_seconds}s window) -> clickhouse",
             flush=True,
         )
 
