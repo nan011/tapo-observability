@@ -1,15 +1,34 @@
-# Tapo Manager
+# Tapo Observability
 
-CLI to manage **many** TP-Link Tapo devices (mixed types/IPs) from one place,
-built on [mihai-dinculescu/tapo](https://github.com/mihai-dinculescu/tapo)
-(Rust core, Python bindings).
+**Power observability for TP-Link Tapo smart plugs.** Continuously samples real
+power draw from your energy-monitoring plugs (P110/P115/…) and lands a clean time
+series in **ClickHouse** — averaged per interval, partitioned by month, keyed by
+device — ready to chart in Metabase/Grafana or query directly. The whole stack
+(ClickHouse + collector) runs from one `docker compose`.
 
-Devices live in a registry file (`./local/devices.json`: name + model + ip). The handler
-for each device is picked generically from its model — `ApiClient.<model>()` —
-so P115, L530, P110, H100, etc. all work without per-type code.
+Built on [mihai-dinculescu/tapo](https://github.com/mihai-dinculescu/tapo)
+(Rust core, Python bindings). Talks to plugs **locally** over the LAN (KLAP) — no
+cloud round-trip. The device handler is chosen generically from each model
+(`ApiClient.<model>()`), so P115, L530, P110, H100, etc. work without per-type code.
 
-`.env` holds only your account email/password — gitignored, never commit it.
-Device IPs go in `./local/devices.json`, built by discovery.
+## What it can do
+
+Observability is the headline, but the same CLI (`main.py`) is a full Tapo
+manager. Entry points:
+
+| Command | What it does |
+|---|---|
+| `monitor` | **Observability** — sample power, write the per-interval mean to ClickHouse (`device_power_usage`). One async task per device, self-healing. |
+| `discover` | Find Tapo devices on the LAN (UDP broadcast); `--save` writes the registry and upserts `device` / `device_snapshot` in ClickHouse. |
+| `list` | Show registered devices (name, model, ip, device_id). |
+| `status` | Live state + current power for a device or `all`. |
+| `on` / `off` | **Control** — switch a plug (or `all`) on/off. |
+| `migrate up/down/status` | ClickHouse schema migrations (`--fake` manages history only). |
+
+Devices live in a registry (`./local/devices.json`: name + model + ip + device_id),
+built by `discover`. Any command targets a device by name, `device_id` prefix
+(git short-SHA style), or `all`. `.env` holds only your TP-Link account
+email/password — gitignored, never commit it.
 
 ## Getting Started
 
@@ -162,3 +181,7 @@ plugs.
 - Credentials live in env vars / gitignored `.env`, never in source.
 - Give the plug a **DHCP reservation** so its IP is stable, and keep it on a
   trusted VLAN if possible.
+
+## License
+
+[MIT](LICENSE) © 2026 Nandhika Prayoga
