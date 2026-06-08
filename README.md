@@ -256,8 +256,8 @@ image's `docker_related_config.xml` and ClickHouse stops listening on the networ
 
 ### Migrations
 
-Each migration is a directory `migrations/NNNN_name/` holding `up.sql` and
-`down.sql`. Applied migrations are tracked in a `schema_migrations` table the
+Each migration is a directory `clickhouse/migrations/NNNN_name/` holding `up.sql`
+and `down.sql`. Applied migrations are tracked in a `schema_migrations` table the
 runner manages itself (it is **not** part of any migration file).
 
 ```bash

@@ -2,8 +2,8 @@
 
 Connection comes from the environment (see .env.example). The migration runner
 tracks applied migrations in a `schema_migrations` table it manages itself — that
-table is NOT part of any migration file. Migrations live in ./migrations as pairs
-of NNNN_name.up.sql / NNNN_name.down.sql.
+table is NOT part of any migration file. Migrations live in ./clickhouse/migrations
+as folders NNNN_name/{up.sql,down.sql}.
 """
 
 from __future__ import annotations
@@ -17,10 +17,10 @@ import clickhouse_connect
 from clickhouse_connect.driver.client import Client
 from dotenv import load_dotenv
 
-MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+MIGRATIONS_DIR = Path(__file__).parent / "clickhouse" / "migrations"
 MIGRATIONS_TABLE = "schema_migrations"
 
-# each migration is a folder: migrations/NNNN_name/{up.sql,down.sql}
+# each migration is a folder: clickhouse/migrations/NNNN_name/{up.sql,down.sql}
 _VERSION_RE = re.compile(r"^(\d+)_(.+)$")
 
 
