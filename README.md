@@ -14,21 +14,27 @@ cloud round-trip. The device handler is chosen generically from each model
 
 ## Tiny on disk
 
-**Three plugs, sampled every 5 seconds, for three years fit in ~1 GiB.** This is
-built to run for years on a Raspberry Pi SD card or a small VPS without thinking
-about storage.
+**One plug sampled every 5 seconds logs ~7.7 million readings a year in ~50 MiB —
+three full years still fits in ~150 MiB.** This is built to run for years on a
+Raspberry Pi SD card or a small VPS without thinking about storage.
 
-In a live test (3 × P115 @ 5s) each row compresses to **~6.5 bytes** on disk
-(38% of raw) — measured ~0.3 MiB/day. The table below uses a deliberately
-conservative **1 MiB/day for 3 devices** budget, so real usage runs *under* it:
+Measured over a steady 12-hour window (3 × P115 @ 5s): **~21,200 rows/day per
+device**, each compressing to **~6.6 bytes** on disk (38% of raw) — about
+**~140 KiB/day per device**. The table pairs **row count** with on-disk size:
 
-| Scope | 1 day | 1 month | 1 year | 3 years |
-|---|---|---|---|---|
-| **1 device** @ 5s | ~0.33 MiB | ~10 MiB | ~120 MiB | ~360 MiB |
-| **3 devices** @ 5s | ~1 MiB | ~30 MiB | ~365 MiB | ~1.1 GiB |
+| Span | **Rows / device** | **On disk / device** | Rows (3 devices) | On disk (3 devices) |
+|---|--:|--:|--:|--:|
+| 1 day | **~21 K** | **~140 KiB** | ~64 K | ~410 KiB |
+| 1 month | **~640 K** | **~4 MiB** | ~1.9 M | ~12 MiB |
+| 1 year | **~7.7 M** | **~50 MiB** | ~23 M | ~150 MiB |
+| 3 years | **~23 M** | **~150 MiB** | ~70 M | ~440 MiB |
 
-Sample slower (e.g. `--interval 30`) and it shrinks proportionally — 3 devices at
-30s ≈ 60 MiB/year.
+> **Per device: a plug logged every 5s for a whole year ≈ 7.7 million rows in
+> ~50 MiB — three full years still fits in ~150 MiB.**
+
+Tens of millions of rows, and the database is still smaller than a phone photo.
+Sample slower (e.g. `--interval 30`) and both row count and size shrink
+proportionally.
 
 Why so small:
 - **Minimal column types** — `LowCardinality(String)` for device_id/name/type,
