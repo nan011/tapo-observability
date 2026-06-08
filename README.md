@@ -12,6 +12,35 @@ Built on [mihai-dinculescu/tapo](https://github.com/mihai-dinculescu/tapo)
 cloud round-trip. The device handler is chosen generically from each model
 (`ApiClient.<model>()`), so P115, L530, P110, H100, etc. work without per-type code.
 
+## Tiny on disk
+
+**Three plugs, sampled every 5 seconds, for three years fit in ~1 GiB.** This is
+built to run for years on a Raspberry Pi SD card or a small VPS without thinking
+about storage.
+
+In a live test (3 × P115 @ 5s) each row compresses to **~6.5 bytes** on disk
+(38% of raw) — measured ~0.3 MiB/day. The table below uses a deliberately
+conservative **1 MiB/day for 3 devices** budget, so real usage runs *under* it:
+
+| Scope | 1 day | 1 month | 1 year | 3 years |
+|---|---|---|---|---|
+| **1 device** @ 5s | ~0.33 MiB | ~10 MiB | ~120 MiB | ~360 MiB |
+| **3 devices** @ 5s | ~1 MiB | ~30 MiB | ~365 MiB | ~1.1 GiB |
+
+Sample slower (e.g. `--interval 30`) and it shrinks proportionally — 3 devices at
+30s ≈ 60 MiB/year.
+
+Why so small:
+- **Minimal column types** — `LowCardinality(String)` for device_id/name/type,
+  `Decimal32(3)` for power and window, `DateTime` (4B) for timestamps, `IPv4`
+  (4B) for addresses. No oversized `Float64`/`UUID`/`String` waste.
+- **ClickHouse columnar compression** — repetitive columns crush to a fraction
+  of their raw size.
+- **System logs disabled** — ClickHouse's own `system.*_log` tables (query_log,
+  trace_log, part_log, …) normally grow unbounded inside the data volume; they're
+  turned off (see [Disk usage](#disk-usage)), so the volume holds *your* data and
+  almost nothing else.
+
 ## What it can do
 
 Observability is the headline, but the same CLI (`main.py`) is a full Tapo
@@ -167,11 +196,15 @@ created by the first migration (column types picked for minimal size):
 - **device_power_usage** — one row per power reading written by `monitor`:
   `device_id` (LowCardinality(String)), `power_used` (Decimal32(3) watts —
   the **mean** over the window), `power_used_at` (DateTime, window close time),
-  `window_seconds` (UInt16 — measured seconds since the previous row's
-  `power_used_at`), `created_at` (DateTime, DB insert time). `MergeTree`,
+  `window_seconds` (Decimal32(3) — measured fractional seconds since the
+  previous row's `power_used_at`), `created_at` (DateTime, DB insert time).
+  `MergeTree`,
   partitioned monthly by `toYYYYMM(power_used_at)`, primary key
   `(device_id, power_used_at)`.
-  Energy: `kWh = power_used * window_seconds / 3600 / 1000`.
+  Energy: `kWh = power_used * window_seconds / 3600 / 1000`. Both operands are
+  `Decimal32(3)`; their product type only keeps 3 integer digits and overflows
+  past 999 — cast to float in queries:
+  `sum(toFloat64(power_used) * toFloat64(window_seconds)) / 3.6e6`.
 - **device_snapshot** — append-only metadata history: `id` (UUIDv7), `device_id`
   (LowCardinality(String)), `created_at` (DateTime), `name`/`type`
   (LowCardinality(String)), `ip` (IPv4). Primary key `(device_id, created_at)`.

@@ -199,7 +199,7 @@ def insert_power(
     device_id: str,
     power_used: float,
     power_used_at: datetime,
-    window_seconds: int,
+    window_seconds: float,
 ) -> None:
     """Insert one power reading. created_at is filled by the DB default.
 
@@ -208,7 +208,7 @@ def insert_power(
     """
     client.insert(
         "device_power_usage",
-        [[device_id, float(power_used), power_used_at, int(window_seconds)]],
+        [[device_id, float(power_used), power_used_at, float(window_seconds)]],
         column_names=["device_id", "power_used", "power_used_at", "window_seconds"],
     )
 

@@ -332,13 +332,12 @@ async def _device_loop(
         mean = sum(samples) / len(samples)
         # Actual seconds since the previous row's power_used_at — the span this
         # mean represents for energy (kWh = power_used * window_seconds / 3.6e6).
-        # First row has no predecessor; fall back to the nominal interval.
-        # Clamp to UInt16 range (the column type).
+        # Kept fractional (the column is Decimal32(3)); first row has no
+        # predecessor, so fall back to the nominal interval.
         if prev_ts is None:
-            window_seconds = interval
+            window_seconds = float(interval)
         else:
-            window_seconds = round((ts - prev_ts).total_seconds())
-        window_seconds = max(1, min(window_seconds, 65535))
+            window_seconds = (ts - prev_ts).total_seconds()
         db.insert_power(
             ch,
             device_id=device.get("device_id") or "",
@@ -349,7 +348,7 @@ async def _device_loop(
         prev_ts = ts
         print(
             f"# {ts.isoformat()} {device['name']} mean {mean:.1f}W "
-            f"({len(samples)}/{n} samples, {window_seconds}s window) -> clickhouse",
+            f"({len(samples)}/{n} samples, {window_seconds:.3f}s window) -> clickhouse",
             flush=True,
         )
 

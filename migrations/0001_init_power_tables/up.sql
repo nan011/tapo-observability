@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS device_power_usage
     device_id      LowCardinality(String),
     power_used     Decimal32(3),
     power_used_at  DateTime,
-    window_seconds UInt16,
+    window_seconds Decimal32(3),
     created_at     DateTime DEFAULT now()
 )
 ENGINE = MergeTree
