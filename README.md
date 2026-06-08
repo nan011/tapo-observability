@@ -197,29 +197,54 @@ uv run python main.py monitor pc-plug 8022B --interval 60      # two devices, 1-
 ## ClickHouse
 
 Set `CLICKHOUSE_*` in `.env` (only `CLICKHOUSE_HOST` is required). Three tables,
-created by the first migration (column types picked for minimal size):
+created by the first migration. Column types are picked for minimal size (see
+[Tiny on disk](#tiny-on-disk)).
 
-- **device_power_usage** — one row per power reading written by `monitor`:
-  `device_id` (LowCardinality(String)), `power_used` (Decimal32(3) watts —
-  the **mean** over the window), `power_used_at` (DateTime, window close time),
-  `window_seconds` (Decimal32(3) — measured fractional seconds since the
-  previous row's `power_used_at`), `created_at` (DateTime, DB insert time).
-  `MergeTree`,
-  partitioned monthly by `toYYYYMM(power_used_at)`, primary key
-  `(device_id, power_used_at)`.
-  Energy: `kWh = power_used * window_seconds / 3600 / 1000`. Both operands are
-  `Decimal32(3)`; their product type only keeps 3 integer digits and overflows
-  past 999 — cast to float in queries:
-  `sum(toFloat64(power_used) * toFloat64(window_seconds)) / 3.6e6`.
-- **device_snapshot** — append-only metadata history: `id` (UUIDv7), `device_id`
-  (LowCardinality(String)), `created_at` (DateTime), `name`/`type`
-  (LowCardinality(String)), `ip` (IPv4). Primary key `(device_id, created_at)`.
-  A new row is written by `discover --save` whenever a device's name/type/ip
-  changes (and once when first seen).
-- **device** — latest known state per device_id: same columns as device_snapshot
-  plus `updated_at` (DateTime). `ReplacingMergeTree(updated_at)`, primary key
-  `device_id` — query with `... FROM device FINAL` to collapse to one current row
-  per device. `discover --save` upserts every seen device here.
+#### `device_power_usage`
+One row per power reading written by `monitor`.
+`MergeTree` · partition `toYYYYMM(power_used_at)` · primary key `(device_id, power_used_at)`
+
+| Column | Type | Meaning |
+|---|---|---|
+| `device_id` | `LowCardinality(String)` | which device |
+| `power_used` | `Decimal32(3)` | **mean** watts over the window |
+| `power_used_at` | `DateTime` | window close time |
+| `window_seconds` | `Decimal32(3)` | measured seconds since the device's previous row |
+| `created_at` | `DateTime` | DB insert time (default `now()`) |
+
+Energy: `kWh = power_used * window_seconds / 3600 / 1000`. Both operands are
+`Decimal32(3)`; their product keeps only 3 integer digits and overflows past 999
+— **cast to float** in queries:
+`sum(toFloat64(power_used) * toFloat64(window_seconds)) / 3.6e6`.
+
+#### `device_snapshot`
+Append-only metadata history — a row is added by `discover --save` whenever a
+device's name/type/ip changes (and once when first seen).
+`MergeTree` · primary key `(device_id, created_at)`
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `UUID` | row id (UUIDv7, default) |
+| `device_id` | `LowCardinality(String)` | which device |
+| `created_at` | `DateTime` | when recorded (default `now()`) |
+| `name` | `LowCardinality(String)` | device name at that time |
+| `type` | `LowCardinality(String)` | device type at that time |
+| `ip` | `IPv4` | device IP at that time |
+
+#### `device`
+Latest known state per `device_id` — `discover --save` upserts every seen device.
+`ReplacingMergeTree(updated_at)` · primary key `device_id` · query with
+`... FROM device FINAL` to collapse to one current row per device.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `UUID` | row id (UUIDv7, default) |
+| `device_id` | `LowCardinality(String)` | which device (the dedup key) |
+| `created_at` | `DateTime` | first seen (default `now()`) |
+| `updated_at` | `DateTime` | last upsert — `ReplacingMergeTree` keeps the newest |
+| `name` | `LowCardinality(String)` | current name |
+| `type` | `LowCardinality(String)` | current type |
+| `ip` | `IPv4` | current IP |
 
 ### Disk usage
 
