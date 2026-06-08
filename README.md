@@ -263,6 +263,16 @@ only shows for energy-monitoring plugs.
 - Give the plug a **DHCP reservation** so its IP is stable, and keep it on a
   trusted VLAN if possible.
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=nan011%2Ftapo-observability&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=nan011/tapo-observability&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=nan011/tapo-observability&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=nan011/tapo-observability&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## License
 
 [MIT](LICENSE) © 2026 Nandhika Prayoga
