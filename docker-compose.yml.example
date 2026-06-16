@@ -24,8 +24,8 @@ services:
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     ports:
-      # Published so you can run `discover --save` (and ad-hoc queries) from the
-      # HOST against the same DB at localhost:8123.
+      # Published so you can run host commands and ad-hoc queries against the
+      # same DB at localhost:8123.
       - "8123:8123"
       - "9000:9000"
     volumes:
@@ -52,10 +52,9 @@ services:
     # reaches Tapo devices by unicast IP (the host NATs container -> LAN), so
     # monitor/status/on/off all work without host networking.
     #
-    # The ONE thing a bridge can't do is DISCOVERY (UDP broadcast to the LAN).
-    # Run discovery on the HOST instead — it writes ./local/devices.json (mounted
-    # below) and, with ClickHouse up, the device/device_snapshot tables:
-    #     uv run python main.py discover --save
+    # DISCOVERY runs in-memory at startup (no device file). Broadcast can't cross
+    # the bridge, so set TAPO_SUBNET in .env and discovery
+    # unicast-scans that subnet — which DOES cross the bridge.
     env_file:
       - .env
     environment:
@@ -65,8 +64,7 @@ services:
       MONITOR_DEVICES: "${MONITOR_DEVICES:-all}"   # which devices: name(s)/id prefix(es)/all
       MONITOR_INTERVAL: "${MONITOR_INTERVAL:-300}" # window seconds (mean per window)
       MONITOR_SAMPLE: "${MONITOR_SAMPLE:-5}"       # sample seconds within the window
-    volumes:
-      - ./local:/app/local       # registry (devices.json) — populated by host discovery
+      # TAPO_SUBNET comes from .env — the subnet (CIDR) to unicast-scan.
     depends_on:
       tapo-clickhouse:
         condition: service_healthy

@@ -1,8 +1,9 @@
 """Tapo manager — control many Tapo devices (mixed types/IPs) from one CLI.
 
-Devices live in a registry file (./local/devices.json): name + model + ip. `discover`
-finds them on the LAN and can save the registry. All other commands target a
-device by name, or `all`.
+There is no device file. Every command DISCOVERS devices on the LAN in memory
+(broadcast, or a unicast subnet scan via TAPO_SUBNET) and operates on that
+list — targeting a device by name, device_id prefix, or `all`. Discovery also
+mirrors device metadata into ClickHouse (device / device_snapshot).
 
 Credentials come from the environment (see .env.example). Nothing hardcoded;
 .env is gitignored. Device handler is chosen generically from the model:
@@ -11,18 +12,15 @@ ApiClient.<model.lower()>(ip) — so P115 -> p115, L530 -> l530, etc.
 
 import argparse
 import asyncio
-import json
+import ipaddress
 import os
 import socket
 from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 from tapo import ApiClient
 
 import db
-
-REGISTRY = Path(__file__).parent / "local/devices.json"
 
 
 # --- config / creds -------------------------------------------------------
@@ -39,12 +37,6 @@ def _require_creds() -> tuple[str, str]:
 
 def _client() -> ApiClient:
     return ApiClient(*_require_creds())
-
-
-def load_registry() -> list[dict]:
-    if not REGISTRY.exists():
-        raise SystemExit(f"No registry yet. Run `discover --save` first ({REGISTRY.name}).")
-    return json.loads(REGISTRY.read_text())
 
 
 def select(devices: list[dict], query: str) -> list[dict]:
@@ -119,134 +111,181 @@ def _slug(nickname: str, model: str, ip: str) -> str:
     return base or ip.replace(".", "-")
 
 
-async def discover(target: str | None, save: bool, timeout: int) -> None:
-    target = target or _default_broadcast()
-    client = _client()
-    print(f"Scanning {target} (timeout {timeout}s) ...")
-    found: list[dict] = []
-    undecodable = 0
-    devices = await client.discover_devices(target, timeout_s=timeout)
-    async for maybe in devices:
-        try:
-            d = maybe.get()  # MaybeDiscoveryResult -> DiscoveryResult
-        except Exception as e:
-            # a device replied but its discovery payload couldn't be decoded —
-            # surface it so it isn't silently lost (often a different creds/region)
-            undecodable += 1
-            print(f"  {'?':<15} {'?':<8} {'UNDECODABLE':<22} {e}")
-            continue
-        if d is None:
-            undecodable += 1
-            print(f"  {'?':<15} {'?':<8} {'UNDECODABLE':<22} (no result)")
-            continue
-        dtype = str(d.device_type).rsplit(".", 1)[-1]  # DeviceType.Hub -> Hub
-        entry = {
-            "name": _slug(d.nickname, d.model, d.ip),
-            "model": d.model,
-            "type": dtype,
-            "device_id": d.device_id,  # stable identity; survives IP changes
-            "ip": d.ip,
-        }
-        found.append(entry)
-        print(f"  {d.ip:<15} {d.model:<8} {dtype:<22} {entry['name']}")
-    msg = f"{len(found)} device(s) found"
-    if undecodable:
-        msg += f", {undecodable} replied but undecodable"
-    print(msg)
+def _env_cidr() -> str | None:
+    """Read the subnet to scan from TAPO_SUBNET (a CIDR), or None.
 
-    if save and found:
-        _merge_save(found)
-
-
-def _merge_save(found: list[dict]) -> None:
-    """Merge discovery results into the registry, keyed by stable device_id.
-
-    Updates IPs for known devices, keeps user-edited names, adds new devices.
-    Existing devices not seen this scan are kept (might be temporarily offline).
-    Legacy entries without a device_id are migrated by matching name or IP.
+    Lets discovery run from a bridge-networked container: broadcast can't cross
+    the bridge, but unicast can, so we sweep every host in this subnet instead.
+    A bare network address (no `/prefix`) is treated as a /24.
     """
-    existing = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else []
-    by_id = {d["device_id"]: d for d in existing if d.get("device_id")}
-    legacy = [d for d in existing if not d.get("device_id")]  # pre-device_id entries
-
-    def pop_legacy(e: dict) -> dict | None:
-        """Find+remove a legacy entry matching this device by name or IP."""
-        for i, old in enumerate(legacy):
-            if old.get("name") == e["name"] or old.get("ip") == e["ip"]:
-                return legacy.pop(i)
+    v = os.getenv("TAPO_SUBNET")
+    if not v:
         return None
-
-    added, changed = 0, 0
-    snapshots: list[dict] = []  # devices whose name/ip/type changed (or are new)
-    for e in found:
-        legacy_match = pop_legacy(e)  # always pop so stale dupes are cleared
-        prev = by_id.get(e["device_id"]) or legacy_match
-        if prev is None:
-            by_id[e["device_id"]] = e
-            added += 1
-            snapshots.append(e)
-        else:
-            # discovery is authoritative — refresh name/model/type/ip per device_id
-            if (prev.get("name"), prev.get("type"), prev.get("ip")) != (
-                e["name"], e["type"], e["ip"]
-            ):
-                changed += 1
-                snapshots.append(e)
-            prev["name"] = e["name"]
-            prev["model"] = e["model"]
-            prev["type"] = e["type"]
-            prev["ip"] = e["ip"]
-            prev["device_id"] = e["device_id"]
-            by_id[e["device_id"]] = prev
-
-    merged = list(by_id.values()) + legacy  # legacy = devices not seen this scan
-    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
-    REGISTRY.write_text(json.dumps(merged, indent=2) + "\n")
-    print(f"Registry: {len(merged)} total ({added} new, {changed} updated) -> {REGISTRY.name}")
-    _sync_clickhouse(found, snapshots)
+    v = v.strip()
+    return v if "/" in v else f"{v}/24"
 
 
-def _sync_clickhouse(all_devices: list[dict], changed: list[dict]) -> None:
-    """Mirror discovery into ClickHouse: refresh `device` (latest per id) for all
-    seen devices, and append a `device_snapshot` row for each changed/new device.
-    No-op if CH is unconfigured; never breaks discovery if CH is down.
+def _hosts_in(cidr: str) -> list[str]:
+    """Expand a CIDR (e.g. 192.168.1.0/24) into its usable host IPs."""
+    net = ipaddress.ip_network(cidr, strict=False)
+    return [str(h) for h in net.hosts()]
+
+
+def _parse_result(maybe) -> dict | None:
+    """Turn a MaybeDiscoveryResult into a registry entry, or None if undecodable."""
+    try:
+        d = maybe.get()  # MaybeDiscoveryResult -> DiscoveryResult
+    except Exception:
+        return None
+    if d is None:
+        return None
+    dtype = str(d.device_type).rsplit(".", 1)[-1]  # DeviceType.Hub -> Hub
+    return {
+        "name": _slug(d.nickname, d.model, d.ip),
+        "model": d.model,
+        "type": dtype,
+        "device_id": d.device_id,  # stable identity; survives IP changes
+        "ip": d.ip,
+    }
+
+
+async def _discover_broadcast(client, target: str, timeout: int, quiet: bool) -> list[dict]:
+    found: list[dict] = []
+    async for maybe in await client.discover_devices(target, timeout_s=timeout):
+        entry = _parse_result(maybe)
+        if entry:
+            found.append(entry)
+            if not quiet:
+                print(f"  {entry['ip']:<15} {entry['model']:<8} {entry['type']:<22} {entry['name']}")
+    return found
+
+
+async def _discover_scan(client, hosts: list[str], timeout: int, concurrency: int, quiet: bool) -> list[dict]:
+    """Unicast-probe every host concurrently. Works over a bridge network where
+    broadcast discovery can't reach the LAN. Dead hosts just time out and are
+    skipped; only Tapo devices that reply are returned."""
+    found: list[dict] = []
+    sem = asyncio.Semaphore(concurrency)
+
+    async def probe(ip: str) -> None:
+        async with sem:
+            try:
+                results = await client.discover_devices(ip, timeout_s=timeout)
+            except Exception:
+                return  # no device / no reply at this IP
+            async for maybe in results:
+                entry = _parse_result(maybe)
+                if entry:
+                    found.append(entry)
+                    if not quiet:
+                        print(f"  {entry['ip']:<15} {entry['model']:<8} {entry['type']:<22} {entry['name']}")
+
+    await asyncio.gather(*(probe(ip) for ip in hosts))
+    return found
+
+
+async def scan_devices(
+    client: ApiClient,
+    *,
+    target: str | None = None,
+    scan: bool = False,
+    cidr: str | None = None,
+    timeout: int = 2,
+    concurrency: int = 64,
+    sync_ch: bool = False,
+    quiet: bool = False,
+) -> list[dict]:
+    """Discover devices and return them IN MEMORY — no file is written.
+
+    Every command that needs the device list calls this and uses the result
+    directly. Unicast-scans the TAPO_SUBNET subnet (works inside a bridge
+    container) when a CIDR is configured and no broadcast target is given;
+    otherwise broadcasts. With sync_ch=True it also mirrors the devices into
+    ClickHouse (`device` / `device_snapshot`).
     """
-    if not all_devices or not db.ch_configured():
+    cidr = cidr or _env_cidr()
+    use_scan = scan or (cidr is not None and target is None)
+
+    if use_scan:
+        if not cidr:
+            raise SystemExit(
+                "Scan mode needs a subnet: set TAPO_SUBNET (e.g. 192.168.1.0/24) or pass --cidr."
+            )
+        hosts = _hosts_in(cidr)
+        if not quiet:
+            print(f"Scanning {cidr} — {len(hosts)} hosts (unicast, timeout {timeout}s, {concurrency} at a time) ...")
+        found = await _discover_scan(client, hosts, timeout, concurrency, quiet)
+    else:
+        target = target or _default_broadcast()
+        if not quiet:
+            print(f"Scanning {target} (broadcast, timeout {timeout}s) ...")
+        found = await _discover_broadcast(client, target, timeout, quiet)
+
+    if not quiet:
+        print(f"{len(found)} device(s) found")
+    if sync_ch:
+        _sync_clickhouse(found)
+    return found
+
+
+def _sync_clickhouse(found: list[dict]) -> None:
+    """Mirror an in-memory scan into ClickHouse: upsert every device into `device`
+    (latest per id), and append a `device_snapshot` row for each device whose
+    name/type/ip differs from what's already in `device` (or is newly seen).
+    No-op if CH is unconfigured; never raises (scanning must work if CH is down).
+    """
+    if not found or not db.ch_configured():
         return
     try:
         client = db.get_client()
-        for d in all_devices:
-            db.upsert_device(
-                client,
-                device_id=d.get("device_id") or "",
-                name=d.get("name") or "",
-                type=d.get("type") or d.get("model") or "",
-                ip=d.get("ip") or "",
-            )
-        for d in changed:
-            db.insert_snapshot(
-                client,
-                device_id=d.get("device_id") or "",
-                name=d.get("name") or "",
-                type=d.get("type") or d.get("model") or "",
-                ip=d.get("ip") or "",
-            )
-        print(f"ClickHouse: {len(all_devices)} device(s) upserted, {len(changed)} snapshot(s).")
-    except Exception as e:  # discovery must work even if CH is down
+        prev = db.current_device_state(client)  # device_id -> (name, type, ip)
+        changed = 0
+        for d in found:
+            did = d.get("device_id") or ""
+            name = d.get("name") or ""
+            type_ = d.get("type") or d.get("model") or ""
+            ip = d.get("ip") or ""
+            db.upsert_device(client, device_id=did, name=name, type=type_, ip=ip)
+            if prev.get(did) != (name, type_, ip):
+                db.insert_snapshot(client, device_id=did, name=name, type=type_, ip=ip)
+                changed += 1
+        print(f"ClickHouse: {len(found)} device(s) upserted, {changed} snapshot(s).")
+    except Exception as e:  # scanning must work even if CH is down
         print(f"# clickhouse sync skipped: {e}")
 
 
-def list_devices() -> None:
-    for d in load_registry():
+async def list_devices() -> None:
+    client = _client()
+    devices = await scan_devices(client, quiet=True)
+    for d in sorted(devices, key=lambda x: x["name"]):
         print(f"  {d['name']:<24} {d['model']:<8} {d['ip']:<15} {d.get('device_id', '-')}")
+
+
+async def discover(
+    target: str | None,
+    timeout: int,
+    scan: bool = False,
+    cidr: str | None = None,
+    concurrency: int = 64,
+) -> None:
+    """Scan and print devices to the console; mirror them into ClickHouse.
+
+    Nothing is written to disk — the device list lives in memory. Commands that
+    need it (monitor/status/on/off/list) run their own scan via `scan_devices`.
+    """
+    client = _client()
+    await scan_devices(
+        client, target=target, scan=scan, cidr=cidr,
+        timeout=timeout, concurrency=concurrency, sync_ch=True,
+    )
 
 
 # --- per-device commands --------------------------------------------------
 
 
 async def status(name: str) -> None:
-    targets = select(load_registry(), name)
     client = _client()
+    targets = select(await scan_devices(client, quiet=True), name)
     for d in targets:
         try:
             h = await handler_for(client, d)
@@ -264,8 +303,8 @@ async def status(name: str) -> None:
 
 
 async def set_power(name: str, turn_on: bool) -> None:
-    targets = select(load_registry(), name)
     client = _client()
+    targets = select(await scan_devices(client, quiet=True), name)
     for d in targets:
         try:
             h = await handler_for(client, d)
@@ -359,8 +398,13 @@ async def monitor(names: list[str], interval: int, sample_s: int) -> None:
     Each device runs in its own asyncio task — a slow or failing device never
     delays or stops the others. Writes to device_power_usage only; requires
     ClickHouse to be configured.
+
+    Discovers the devices in memory at startup (this is the per-boot discovery —
+    it also mirrors device metadata into ClickHouse), then monitors them.
     """
-    targets = select_many(load_registry(), names)
+    ch = db.get_client()  # CH-only sink; fails fast if unconfigured
+    client = _client()
+    targets = select_many(await scan_devices(client, sync_ch=True), names)
     energy = [d for d in targets if d["model"].lower() in ("p110", "p110m", "p115")]
     skipped = [d["name"] for d in targets if d not in energy]
     if skipped:
@@ -369,8 +413,6 @@ async def monitor(names: list[str], interval: int, sample_s: int) -> None:
         raise SystemExit("No energy-monitoring devices to watch.")
 
     sample_s = max(1, min(sample_s, interval))  # can't sample faster than 1s or slower than window
-    ch = db.get_client()  # CH-only sink; fails fast if unconfigured
-    client = _client()
     print(
         f"# monitoring {len(energy)} device(s): mean of ~{max(1, round(interval / sample_s))} "
         f"samples every {interval}s (sample {sample_s}s) -> ClickHouse — Ctrl-C to stop",
@@ -386,12 +428,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Tapo multi-device manager")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    disc = sub.add_parser("discover", help="Find Tapo devices on the LAN")
+    disc = sub.add_parser("discover", help="Scan + print devices (and mirror to ClickHouse)")
     disc.add_argument("--target", help="Broadcast addr; auto-detected if omitted")
-    disc.add_argument("--save", action="store_true", help="Write results to ./local/devices.json")
-    disc.add_argument("--timeout", type=int, default=5, help="Scan seconds (default 5)")
+    disc.add_argument("--timeout", type=int, default=2, help="Per-target seconds (default 2)")
+    disc.add_argument(
+        "--scan", action="store_true",
+        help="Unicast-sweep a subnet instead of broadcasting (works inside a bridge container)",
+    )
+    disc.add_argument(
+        "--cidr",
+        help="Subnet to scan, e.g. 192.168.1.0/24 (else from TAPO_SUBNET)",
+    )
+    disc.add_argument(
+        "--concurrency", type=int, default=64, help="Parallel probes when scanning (default 64)"
+    )
 
-    sub.add_parser("list", help="List registered devices")
+    sub.add_parser("list", help="Scan and list devices")
 
     st = sub.add_parser("status", help="Show state (+power) for a device or 'all'")
     st.add_argument("name", nargs="?", default="all", help="Name, id prefix, or 'all'")
@@ -422,9 +474,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "discover":
-        asyncio.run(discover(args.target, args.save, args.timeout))
+        asyncio.run(discover(
+            args.target, args.timeout,
+            scan=args.scan, cidr=args.cidr, concurrency=args.concurrency,
+        ))
     elif args.cmd == "list":
-        list_devices()
+        asyncio.run(list_devices())
     elif args.cmd == "status":
         asyncio.run(status(args.name))
     elif args.cmd == "on":

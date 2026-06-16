@@ -6,9 +6,9 @@
 #   sh ./scripts/main.sh list
 #   sh ./scripts/main.sh status all
 #   sh ./scripts/main.sh migrate up
-# Any command/flags main.py accepts work here. NOTE: `discover` needs LAN
-# broadcast and won't work from the bridge-networked container — run that on the
-# HOST:  uv run python main.py discover --save
+# Any command/flags main.py accepts work here. NOTE: broadcast `discover` won't
+# work from the bridge-networked container — use the unicast scan instead:
+#   sh ./scripts/main.sh discover --scan   (uses TAPO_SUBNET from .env)
 # POSIX sh — runs under dash or bash.
 set -eu
 cd "$(dirname "$0")/.."

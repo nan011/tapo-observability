@@ -55,16 +55,17 @@ manager. Entry points:
 | Command | What it does |
 |---|---|
 | `monitor` | **Observability** — sample power, write the per-interval mean to ClickHouse (`device_power_usage`). One async task per device, self-healing. |
-| `discover` | Find Tapo devices on the LAN (UDP broadcast); `--save` writes the registry and upserts `device` / `device_snapshot` in ClickHouse. |
+| `discover` | Scan the LAN and **print the device list** — UDP broadcast, or `--scan` to unicast-sweep a subnet (works inside a bridge container). Also mirrors `device` / `device_snapshot` into ClickHouse. |
 | `list` | Show registered devices (name, model, ip, device_id). |
 | `status` | Live state + current power for a device or `all`. |
 | `on` / `off` | **Control** — switch a plug (or `all`) on/off. |
 | `migrate up/down/status` | ClickHouse schema migrations (`--fake` manages history only). |
 
-Devices live in a registry (`./local/devices.json`: name + model + device_id + ip + type),
-built by `discover`. Any command targets a device by name, `device_id` prefix
-(git short-SHA style), or `all`. `.env` holds only your TP-Link account
-email/password — gitignored, never commit it.
+Every command discovers devices on the LAN (broadcast, or a unicast subnet scan —
+see below) and keeps the list **in memory for that run**; `discover`/`list` also
+print it to the console. Any command targets a device by name, `device_id` prefix
+(git short-SHA style), or `all`. `.env` holds your TP-Link account email/password
+and the scan subnet (`TAPO_SUBNET`) — gitignored, never commit it.
 
 ## Getting Started
 
@@ -73,38 +74,38 @@ reaches ClickHouse by service name and reaches Tapo devices by unicast IP (the
 host NATs the container out to your LAN), so `monitor` works without host
 networking.
 
-**Discovery is a host step.** UDP broadcast can't cross a bridge, so you run
-discovery on the host once — it writes `./local/devices.json` (mounted into the
-container) and, with ClickHouse up, the `device` / `device_snapshot` tables.
+**Discovery runs in memory** — `monitor` discovers devices at startup (every
+boot), holds the list in memory, and monitors them, mirroring `device` /
+`device_snapshot` into ClickHouse. UDP broadcast can't cross the bridge, so set
+`TAPO_SUBNET` (a CIDR like `192.168.1.0/24`) in `.env` and discovery
+**unicast-scans** that subnet, which *does* cross the bridge. It re-scans on
+every `docker compose up`, so device IP changes self-heal.
 
 ```bash
-cp .env.example .env                              # set TAPO creds + MONITOR_* params
+cp .env.example .env                              # set TAPO creds + TAPO_SUBNET + MONITOR_* params
 cp docker-compose.yml.example docker-compose.yml  # one-time; edit freely (gitignored)
-
-uv sync                                           # host deps
-uv run python main.py discover --save             # populate ./local/devices.json (+ CH if up)
 
 sh scripts/start.sh                               # build, down, up --build, follow logs
 ```
 
-The container runs migrations, waits for `./local/devices.json` if it isn't
-there yet, then starts `monitor` (mean power per interval into
-`device_power_usage`). Re-run the host `discover --save` whenever devices change
-(new device, renamed, new IP).
+The container runs migrations, then starts `monitor` — which scans
+`TAPO_SUBNET` for devices, keeps them in memory, and begins writing per-window
+mean power into `device_power_usage`. No pre-seeding step.
 
 `docker-compose.yml` is gitignored so your local edits stay out of version
 control — copy it from the committed `docker-compose.yml.example` once, before
 the first `start.sh`.
 
-Configure the run via `.env` (the service's `monitor` takes two parameters):
+Configure the run via `.env`:
 
+- `TAPO_SUBNET` — subnet (CIDR) to unicast-scan for devices (required in the container)
 - `MONITOR_DEVICES` — which devices: name(s)/id prefix(es), space-separated, or `all`
 - `MONITOR_INTERVAL` — window seconds; one **mean** row per window per device
 - `MONITOR_SAMPLE` — seconds between samples inside the window
 
-> Want discovery to run *inside* the container instead? Switch the service to
-> `network_mode: host` in `docker-compose.yml` and set `RUN_DISCOVERY=true` —
-> then it discovers on startup (Linux only; reach ClickHouse via `127.0.0.1`).
+> **Prefer broadcast inside the container?** Switch the service to
+> `network_mode: host` (Linux only; reach ClickHouse via `127.0.0.1`) and leave
+> `TAPO_SUBNET` unset — `monitor` then discovers via broadcast.
 
 `scripts/start.sh` pulls images, runs `docker compose down`, brings the stack up
 with `--build -d`, and tails the app logs (it errors out if `docker-compose.yml`
@@ -125,11 +126,18 @@ It reads `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD`/`CLICKHOUSE_DATABASE` from `.en
 (falling back to `default`/empty/`default`).
 
 
-## Development Setup
+## Run Locally
+
+The Docker flow above needs no Python on the host. To run the `main.py` CLI
+directly — host-run `discover`/`list`/`status`/`on`/`off`/`monitor`, or
+development — install the deps with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync                 # install deps (tapo, python-dotenv)
-cp .env.example .env    # then edit .env with your TP-Link creds
+uv sync                 # install deps (tapo, clickhouse-connect, python-dotenv)
+cp .env.example .env    # then edit .env with your TP-Link creds (+ CLICKHOUSE_* if using the DB)
+
+uv run python main.py discover    # broadcast discovery works on the host
+uv run python main.py status all
 ```
 
 ## Usage
@@ -143,17 +151,25 @@ sh ./scripts/main.sh status all
 sh ./scripts/main.sh migrate up
 ```
 
-Most commands work this way. **Exception:** `discover` needs LAN broadcast,
-which the bridge-networked container can't do — run it on the **host**:
-`uv run python main.py discover --save`.
+Every command discovers devices first and holds them in memory for that run, then
+acts. **`discover`** is the one that cares about networking: broadcast needs the
+host (or host networking), but `--scan` unicast-sweeps a subnet and works
+straight from the bridge container:
 
 ```bash
-# 1. find devices and save the registry (auto-detects your /24 subnet)
-uv run python main.py discover --save
-uv run python main.py discover --target 192.168.1.255 --save   # or pass broadcast explicitly
+sh ./scripts/main.sh discover --scan          # uses TAPO_SUBNET from .env
+sh ./scripts/main.sh discover --scan --cidr 192.168.1.0/24
+sh ./scripts/main.sh list                     # same scan, then lists
+```
 
-# 2. inspect / control by name (or 'all')
-uv run python main.py list             # show registered devices
+```bash
+# discover: scan + print devices, mirror metadata to ClickHouse
+uv run python main.py discover                          # broadcast (host); auto-detects /24
+uv run python main.py discover --target 192.168.1.255  # broadcast to an explicit address
+uv run python main.py discover --scan --cidr 192.168.1.0/24  # unicast sweep (works in-container)
+
+# inspect / control by name (or 'all') — each scans first
+uv run python main.py list             # discover + show devices
 uv run python main.py status           # state (+power) for every device
 uv run python main.py status office    # one device
 uv run python main.py on office        # turn a device on
@@ -218,8 +234,8 @@ Energy: `kWh = power_used * window_seconds / 3600 / 1000`. Both operands are
 `sum(toFloat64(power_used) * toFloat64(window_seconds)) / 3.6e6`.
 
 #### `device_snapshot`
-Append-only metadata history — a row is added by `discover --save` whenever a
-device's name/type/ip changes (and once when first seen).
+Append-only metadata history — a row is added on any scan whenever a device's
+name/type/ip differs from what's in `device` (and once when first seen).
 `MergeTree` · primary key `(device_id, created_at)`
 
 | Column | Type | Meaning |
@@ -232,7 +248,7 @@ device's name/type/ip changes (and once when first seen).
 | `ip` | `IPv4` | device IP at that time |
 
 #### `device`
-Latest known state per `device_id` — `discover --save` upserts every seen device.
+Latest known state per `device_id` — every scan upserts each seen device.
 `ReplacingMergeTree(updated_at)` · primary key `device_id` · query with
 `... FROM device FINAL` to collapse to one current row per device.
 
@@ -270,10 +286,10 @@ uv run python main.py migrate up --fake        # mark pending as applied
 uv run python main.py migrate down 2 --fake    # unmark without dropping anything
 ```
 
-Each registry entry is `{"name", "model", "device_id", "ip", "type"}`; `name`
-defaults to the device nickname (slugged). Edit `./local/devices.json` to rename.
-Devices without on/off (hubs, sensors) are skipped by `on`/`off`; power readout
-only shows for energy-monitoring plugs.
+Each discovered device is `{"name", "model", "device_id", "ip", "type"}`; `name`
+is the device nickname (slugged) — rename the plug in the Tapo app and the next
+scan picks it up. Devices without on/off (hubs, sensors) are skipped by
+`on`/`off`; power readout only shows for energy-monitoring plugs.
 
 ## Security notes
 

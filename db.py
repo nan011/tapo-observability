@@ -224,6 +224,21 @@ def insert_snapshot(
     )
 
 
+def current_device_state(client: Client) -> dict[str, tuple[str, str, str]]:
+    """Return {device_id: (name, type, ip)} of the latest `device` rows.
+
+    Used to decide which scanned devices changed (→ a new device_snapshot).
+    Returns {} if the table doesn't exist yet (pre-migration).
+    """
+    try:
+        rows = client.query(
+            "SELECT device_id, name, type, ip FROM device FINAL"
+        ).result_rows
+    except Exception:
+        return {}
+    return {r[0]: (r[1], r[2], str(r[3])) for r in rows}
+
+
 def upsert_device(
     client: Client, *, device_id: str, name: str, type: str, ip: str
 ) -> None:
