@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import ipaddress
 import os
+import re
 import socket
 from datetime import datetime, timezone
 
@@ -131,14 +132,42 @@ def _hosts_in(cidr: str) -> list[str]:
     return [str(h) for h in net.hosts()]
 
 
-def _parse_result(maybe) -> dict | None:
-    """Turn a MaybeDiscoveryResult into a registry entry, or None if undecodable."""
+_THIRD_PARTY_HINT = (
+    "auth refused (FORBIDDEN) — the DEVICE rejected TAPO_USERNAME. Usually it is "
+    "owned by (not just shared with) another Tapo account; otherwise power-cycle it "
+    "to re-sync a changed password, and check Me > Third-Party Services is on"
+)
+
+
+def _describe_failure(exc: Exception) -> tuple[str, str]:
+    """Boil a DiscoveryError down to (ip, short reason) for the skipped list.
+
+    The tapo binding raises a plain Exception whose text is the Rust Debug repr,
+    e.g. DiscoveryError { ip: "1.2.3.4", source: Tapo(Unauthorized { ... }) } —
+    so the IP and the failure kind are pulled back out of that text.
+    """
+    text = str(exc)
+    m = re.search(r'ip:\s*"([^"]+)"', text)
+    ip = m.group(1) if m else "?"
+    if "FORBIDDEN" in text or "Unauthorized" in text:
+        return ip, _THIRD_PARTY_HINT
+    kind = re.search(r'kind:\s*"([^"]+)"', text)
+    return ip, kind.group(1) if kind else text
+
+
+def _parse_result(maybe) -> tuple[dict | None, tuple[str, str] | None]:
+    """Turn a MaybeDiscoveryResult into (entry, failure).
+
+    A device that answers discovery but can't be decoded (most often: auth
+    refused) returns a failure instead of being silently dropped — otherwise it
+    just vanishes from the scan with no hint why.
+    """
     try:
         d = maybe.get()  # MaybeDiscoveryResult -> DiscoveryResult
-    except Exception:
-        return None
+    except Exception as e:
+        return None, _describe_failure(e)
     if d is None:
-        return None
+        return None, None
     dtype = str(d.device_type).rsplit(".", 1)[-1]  # DeviceType.Hub -> Hub
     return {
         "name": _slug(d.nickname, d.model, d.ip),
@@ -146,25 +175,43 @@ def _parse_result(maybe) -> dict | None:
         "type": dtype,
         "device_id": d.device_id,  # stable identity; survives IP changes
         "ip": d.ip,
-    }
+    }, None
 
 
-async def _discover_broadcast(client, target: str, timeout: int, quiet: bool) -> list[dict]:
+def _print_skipped(failures: list[tuple[str, str]]) -> None:
+    """Report devices that answered but couldn't be read, so they aren't lost silently."""
+    if not failures:
+        return
+    print(f"{len(failures)} device(s) answered but could not be read:")
+    for ip, reason in sorted(set(failures)):
+        print(f"  {ip:<15} {reason}")
+
+
+async def _discover_broadcast(
+    client, target: str, timeout: int, quiet: bool
+) -> tuple[list[dict], list[tuple[str, str]]]:
     found: list[dict] = []
+    failures: list[tuple[str, str]] = []
     async for maybe in await client.discover_devices(target, timeout_s=timeout):
-        entry = _parse_result(maybe)
+        entry, failure = _parse_result(maybe)
         if entry:
             found.append(entry)
             if not quiet:
                 print(f"  {entry['ip']:<15} {entry['model']:<8} {entry['type']:<22} {entry['name']}")
-    return found
+        elif failure:
+            failures.append(failure)
+    return found, failures
 
 
-async def _discover_scan(client, hosts: list[str], timeout: int, concurrency: int, quiet: bool) -> list[dict]:
+async def _discover_scan(
+    client, hosts: list[str], timeout: int, concurrency: int, quiet: bool
+) -> tuple[list[dict], list[tuple[str, str]]]:
     """Unicast-probe every host concurrently. Works over a bridge network where
     broadcast discovery can't reach the LAN. Dead hosts just time out and are
-    skipped; only Tapo devices that reply are returned."""
+    skipped; only Tapo devices that reply are returned. Devices that reply but
+    can't be decoded (e.g. auth refused) come back in the failures list."""
     found: list[dict] = []
+    failures: list[tuple[str, str]] = []
     sem = asyncio.Semaphore(concurrency)
 
     async def probe(ip: str) -> None:
@@ -174,14 +221,16 @@ async def _discover_scan(client, hosts: list[str], timeout: int, concurrency: in
             except Exception:
                 return  # no device / no reply at this IP
             async for maybe in results:
-                entry = _parse_result(maybe)
+                entry, failure = _parse_result(maybe)
                 if entry:
                     found.append(entry)
                     if not quiet:
                         print(f"  {entry['ip']:<15} {entry['model']:<8} {entry['type']:<22} {entry['name']}")
+                elif failure:
+                    failures.append((failure[0] if failure[0] != "?" else ip, failure[1]))
 
     await asyncio.gather(*(probe(ip) for ip in hosts))
-    return found
+    return found, failures
 
 
 async def scan_devices(
@@ -214,15 +263,16 @@ async def scan_devices(
         hosts = _hosts_in(cidr)
         if not quiet:
             print(f"Scanning {cidr} — {len(hosts)} hosts (unicast, timeout {timeout}s, {concurrency} at a time) ...")
-        found = await _discover_scan(client, hosts, timeout, concurrency, quiet)
+        found, failures = await _discover_scan(client, hosts, timeout, concurrency, quiet)
     else:
         target = target or _default_broadcast()
         if not quiet:
             print(f"Scanning {target} (broadcast, timeout {timeout}s) ...")
-        found = await _discover_broadcast(client, target, timeout, quiet)
+        found, failures = await _discover_broadcast(client, target, timeout, quiet)
 
     if not quiet:
         print(f"{len(found)} device(s) found")
+        _print_skipped(failures)
     if sync_ch:
         _sync_clickhouse(found)
     return found
