@@ -43,6 +43,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   tapo-observability:                          # [scripts] don't rename this SERVICE KEY — start.sh/main.sh anchor on it
     build: .
